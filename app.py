@@ -95,9 +95,15 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         # --- Panel Derecho ---
         with gr.Column(scale=3):
             with gr.Row():
-                out_original = gr.Image(label="Imagen Original", type="pil")
-                out_gt = gr.Image(label="Verdad Fundamental", type="pil")
-                out_pred = gr.Image(label="Máscara Predicha", type="pil")
+                with gr.Column():
+                    gr.Markdown("<h3 style='text-align: center;'>Imagen Original</h3>")
+                    out_original = gr.Image(type="pil", show_label=False)
+                with gr.Column():
+                    gr.Markdown("<h3 style='text-align: center;'>Verdad Fundamental</h3>")
+                    out_gt = gr.Image(type="pil", show_label=False)
+                with gr.Column():
+                    gr.Markdown("<h3 style='text-align: center;'>Máscara Predicha</h3>")
+                    out_pred = gr.Image(type="pil", show_label=False)
     
     # --- Funciones para los eventos de la UI ---
     def load_image_from_selector(selection_str):
