@@ -83,14 +83,16 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     with gr.Row():
         # --- Panel Izquierdo ---
         with gr.Column(scale=2, min_width=300):
+            gr.Markdown("<h3 style='text-align: center;'>Seleccionar Imagen de Prueba</h3>")
             image_selector = gr.Dropdown(
                 choices=[f"Image {i}" for i in range(len(dataset))],
-                label="Seleccionar Imagen de Prueba"
+                show_label=False
             )
-            # Volvemos a gr.Image
-            input_image = gr.Image(label="Imagen para Aviso Interactivo", type="pil", sources=[])
+            gr.Markdown("<h3 style='text-align: center;'>Imagen para Aviso Interactivo</h3>")
+            input_image = gr.Image(type="pil", sources=[], show_label=False)
             run_button = gr.Button("Ejecutar Inferencia")
-            status_text = gr.Textbox(label="Estado", interactive=False, lines=2)
+            gr.Markdown("<h3 style='text-align: center;'>Estado</h3>")
+            status_text = gr.Textbox(interactive=False, lines=2, show_label=False)
 
         # --- Panel Derecho ---
         with gr.Column(scale=3):
