@@ -1,210 +1,145 @@
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from PIL import Image
-from datasets import load_dataset
-from transformers import SamProcessor, SamModel
 import gradio as gr
-import torch.nn as nn # Asegúrate de importar nn para DataParallel si no lo hiciste antes
+import torch
+import numpy as np
+from PIL import Image
+from transformers import SamModel, SamProcessor
+from datasets import load_dataset
+import matplotlib.pyplot as plt
 
-# --- 1. Cargar el conjunto de datos y el modelo (adaptado de tu script original) ---
-# Si ya has ejecutado las celdas anteriores de tu notebook, puedes saltar la carga del modelo.
-# Pero para que este script sea autocontenido, lo incluimos aquí.
+# Cargar el conjunto de datos
+dataset = load_dataset("nielsr/breast-cancer", split="train").train_test_split(test_size=0.2, seed=42)['test']
 
-print("Cargando conjunto de datos...")
-dataset_orig = load_dataset("nielsr/breast-cancer", split="train")
-dataset = dataset_orig.train_test_split(test_size=2, seed=42) # Mantener el test_size pequeño para la demo
-print("Conjunto de datos cargado.")
-
-print("Cargando modelo SAM...")
-processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
-
-print("Cargando pesos SAM...")
-model = SamModel.from_pretrained("facebook/sam-vit-base")
-model.load_state_dict(torch.load('sam_model_weights.pth'))
-
-
-# Asegúrate de que el modelo esté en el dispositivo correcto y sea DataParallel si es necesario
+# Cargar el modelo y el procesador
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = nn.DataParallel(model) # Si usaste DataParallel en el entrenamiento
+processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+model = SamModel.from_pretrained("facebook/sam-vit-base")
+
+# Cargar los pesos del modelo guardados
+try:
+    weights_path = 'sam_model_weights.pth'
+    model.load_state_dict(torch.load(weights_path, map_location=device))
+    print(f"Pesos del modelo cargados desde {weights_path}")
+except FileNotFoundError:
+    print(f"Advertencia: no se encontró el archivo de pesos en {weights_path}. Usando pesos preentrenados.")
+
 model.to(device)
-model.eval() # Asegúrate de que el modelo esté en modo evaluación para la inferencia
-print(f"Modelo SAM cargado y en modo evaluación en dispositivo: {device}.")
+model.eval()
 
-# --- 2. Funciones auxiliares para visualización y el prompt de punto ---
+def apply_mask(image_pil, mask_np):
+    """Aplica una máscara de color a una imagen PIL."""
+    if image_pil is None or mask_np is None:
+        return Image.new('RGB', (256, 256), 'white')
+    image_rgba = image_pil.convert("RGBA")
+    # Color de la máscara: azul semitransparente
+    color = np.array([30, 144, 255, 153], dtype=np.uint8)
+    mask_rgba = np.zeros((*mask_np.shape, 4), dtype=np.uint8)
+    mask_rgba[mask_np > 0] = color
+    mask_image_pil = Image.fromarray(mask_rgba)
+    
+    # Superponer la máscara en la imagen original
+    return Image.alpha_composite(image_rgba, mask_image_pil)
 
-def show_mask(mask, ax, color=[30/255, 144/255, 255/255, 0.6]): # Color fijo para las máscaras
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * np.array(color).reshape(1, 1, -1)
-    ax.imshow(mask_image)
+# Función principal de inferencia
+def run_inference(image_pil, prompt_box):
+    """Ejecuta la inferencia en la imagen seleccionada con un aviso de cuadro delimitador."""
+    blank_image = Image.new('RGB', (256, 256), 'white')
+    if image_pil is None:
+        return blank_image, blank_image, blank_image, "Por favor, carga una imagen primero."
+    if prompt_box is None:
+        return image_pil, image_pil, image_pil, "Por favor, define un rectángulo con dos clics en la imagen."
 
-def show_points(coords, labels, ax, marker_size=375):
-    pos_points = coords[labels==1]
-    neg_points = coords[labels==0]
-    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
-    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
+    inputs = processor(image_pil, input_boxes=[[prompt_box]], return_tensors="pt").to(device)
 
-# --- 3. Función principal de inferencia interactiva ---
-
-def run_sam_inference(image_index, selected_point_x, selected_point_y):
-    """
-    Ejecuta la inferencia del modelo SAM basada en una imagen seleccionada y un punto.
-
-    Args:
-        image_index (int): El índice de la imagen en el conjunto de datos de prueba.
-        selected_point_x (float): La coordenada X del clic del usuario.
-        selected_point_y (float): La coordenada Y del clic del usuario.
-
-    Returns:
-        tuple: Un tuple de 3 imágenes PIL: (imagen_original, imagen_con_gt_mask, imagen_con_pred_mask)
-    """
-    if selected_point_x is None or selected_point_y is None:
-        # Si no se ha hecho clic, mostramos solo la imagen original y la verdad fundamental.
-        # Esto puede ocurrir si el usuario cambia la imagen sin hacer clic.
-        image = dataset["test"][image_index]["image"]
-        ground_truth_mask = np.array(dataset["test"][image_index]["label"])
-
-        fig_gt, axes_gt = plt.subplots(figsize=(6, 6))
-        axes_gt.imshow(np.array(image))
-        show_mask(ground_truth_mask, axes_gt)
-        axes_gt.set_title("Máscara de Verdad Fundamental")
-        axes_gt.axis("off")
-        fig_gt.canvas.draw()
-        gt_image_pil = Image.frombytes('RGB', fig_gt.canvas.get_width_height(), fig_gt.canvas.tostring_rgb())
-        plt.close(fig_gt) # Cierra la figura para liberar memoria
-
-        return image, gt_image_pil, Image.new('RGB', image.size, (128, 128, 128)) # Devuelve una imagen gris para la predicha
-
-    # Cargar la imagen y la máscara de verdad fundamental
-    image = dataset["test"][image_index]["image"]
-    ground_truth_mask = np.array(dataset["test"][image_index]["label"])
-
-    # Crear el prompt de punto a partir de las coordenadas del clic
-    input_points = np.array([[selected_point_x, selected_point_y]])
-    input_labels = np.array([1]) # Etiqueta 1 para un punto positivo
-
-    # Preparar la imagen y el prompt para el modelo
-    # El processor espera input_points como una lista de arrays de numpy
-    # y input_labels como una lista de arrays de numpy
-    inputs = processor(image, input_points=[input_points], input_labels=[input_labels], return_tensors="pt").to(device)
-
-    # Realizar la inferencia
     with torch.no_grad():
         outputs = model(**inputs, multimask_output=False)
 
-    # Aplicar sigmoide y convertir a máscara binaria
     medsam_seg_prob = torch.sigmoid(outputs.pred_masks.squeeze(1))
     medsam_seg_prob = medsam_seg_prob.cpu().numpy().squeeze()
-    medsam_seg = (medsam_seg_prob > 0.5).astype(np.uint8)
+    predicted_mask = (medsam_seg_prob > 0.5).astype(np.uint8)
 
-    # --- Generar visualizaciones ---
-    # Imagen Original
-    original_image_pil = image
+    ground_truth_mask = None
+    image_np = np.array(image_pil)
+    for example in dataset:
+        if np.array_equal(np.array(example['image']), image_np):
+            ground_truth_mask = np.array(example['label'])
+            break
+    
+    gt_image_with_mask = apply_mask(image_pil, ground_truth_mask)
+    pred_image_with_mask = apply_mask(image_pil, predicted_mask)
 
-    # Imagen con Máscara de Verdad Fundamental
-    fig_gt, axes_gt = plt.subplots(figsize=(6, 6))
-    axes_gt.imshow(np.array(image))
-    show_mask(ground_truth_mask, axes_gt)
-    axes_gt.set_title("Máscara de Verdad Fundamental")
-    axes_gt.axis("off")
-    fig_gt.canvas.draw()
-    gt_image_pil = Image.frombytes('RGB', fig_gt.canvas.get_width_height(), fig_gt.canvas.tostring_rgb())
-    plt.close(fig_gt)
+    return image_pil, gt_image_with_mask, pred_image_with_mask, "Inferencia completada."
 
-    # Imagen con Máscara Predicha y el punto de prompt
-    fig_pred, axes_pred = plt.subplots(figsize=(6, 6))
-    axes_pred.imshow(np.array(image))
-    show_mask(medsam_seg, axes_pred)
-    show_points(input_points, input_labels, axes_pred) # Mostrar el punto usado como prompt
-    axes_pred.set_title("Máscara Predicha (con Prompt)")
-    axes_pred.axis("off")
-    fig_pred.canvas.draw()
-    pred_image_pil = Image.frombytes('RGB', fig_pred.canvas.get_width_height(), fig_pred.canvas.tostring_rgb())
-    plt.close(fig_pred)
+# Interfaz de Gradio
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    # Componentes de estado para mantener los datos entre interacciones
+    image_state = gr.State()
+    prompt_box_state = gr.State()
+    # Nuevo estado para almacenar la primera esquina del rectángulo
+    corner_one_state = gr.State()
 
-    return original_image_pil, gt_image_pil, pred_image_pil
-
-# --- 4. Interfaz Gradio ---
-
-# Creamos una lista de opciones para el selector de imagen
-image_choices = [(f"Imagen {i}", i) for i in range(len(dataset["test"]))]
-
-with gr.Blocks() as demo:
-    gr.Markdown(
-        """
-        # Demo interactiva de SAM para Cáncer de Mama
-        Selecciona una imagen, haz clic en una región de interés para generar un "prompt" y observa la segmentación predicha.
-        """
-    )
+    gr.Markdown("## Inferencia Interactiva de Cáncer de Mama con SAM")
+    gr.Markdown("1. Elige una imagen del menú. 2. Haz clic dos veces en la imagen para definir un rectángulo. 3. Ejecuta la inferencia.")
 
     with gr.Row():
-        with gr.Column():
+        # --- Panel Izquierdo ---
+        with gr.Column(scale=2, min_width=300):
             image_selector = gr.Dropdown(
-                choices=image_choices,
-                label="Seleccionar Imagen de Prueba",
-                value=0 # Por defecto selecciona la primera imagen
+                choices=[f"Image {i}" for i in range(len(dataset))],
+                label="Seleccionar Imagen de Prueba"
             )
-            # Componente para mostrar la imagen seleccionada y capturar el clic
-            input_image_display = gr.Image(
-                label="Haz clic para un prompt",
-                interactive=True,
-                sources=["upload"] # Permitir carga para visualización si es necesario
-            )
+            # Volvemos a gr.Image
+            input_image = gr.Image(label="Imagen para Aviso Interactivo", type="pil", sources=[])
             run_button = gr.Button("Ejecutar Inferencia")
+            status_text = gr.Textbox(label="Estado", interactive=False, lines=2)
 
-        with gr.Column():
-            gr.Markdown("### Resultado de la Segmentación")
+        # --- Panel Derecho ---
+        with gr.Column(scale=3):
             with gr.Row():
-                output_original = gr.Image(label="Imagen Original", interactive=False)
-                output_ground_truth = gr.Image(label="Máscara Verdad Fundamental", interactive=False)
-                output_predicted = gr.Image(label="Máscara Predicha", interactive=False)
+                out_original = gr.Image(label="Imagen Original", type="pil")
+                out_gt = gr.Image(label="Verdad Fundamental", type="pil")
+                out_pred = gr.Image(label="Máscara Predicha", type="pil")
+    
+    # --- Funciones para los eventos de la UI ---
+    def load_image_from_selector(selection_str):
+        """Carga la imagen seleccionada y reinicia los estados."""
+        if not selection_str:
+            return None, None, None, None, "Por favor, selecciona una imagen."
+        image_idx = int(selection_str.split(' ')[1])
+        image_pil = dataset[image_idx]["image"]
+        # Reiniciar todos los estados al cargar una nueva imagen
+        return image_pil, image_pil, None, None, "Imagen cargada. Haz clic una vez para la primera esquina."
+    
+    def handle_image_click(first_corner, evt: gr.SelectData):
+        """Maneja los clics para definir el cuadro delimitador."""
+        clicked_point = evt.index
+        if first_corner is None:
+            # Es el primer clic, guardamos la esquina
+            return clicked_point, None, f"Primera esquina en {clicked_point}. Haz clic de nuevo para la segunda."
+        else:
+            # Es el segundo clic, creamos la caja
+            x1, y1 = first_corner
+            x2, y2 = clicked_point
+            prompt_box = [int(min(x1, x2)), int(min(y1, y2)), int(max(x1, x2)), int(max(y1, y2))]
+            # Reiniciamos el estado de la primera esquina para la próxima vez
+            return None, prompt_box, f"Rectángulo definido. Listo para la inferencia."
 
-    # Variables para almacenar el estado del clic
-    clicked_x = gr.State(None)
-    clicked_y = gr.State(None)
-
-    # --- Lógica de la interfaz ---
-
-    def update_image_display(image_idx):
-        # Actualiza la imagen mostrada cuando se selecciona una nueva imagen
-        image = dataset["test"][image_idx]["image"]
-        # Limpiamos las coordenadas del clic anterior al cambiar de imagen
-        return image, None, None
-
+    # --- Conectar los componentes de la UI a las funciones ---
     image_selector.change(
-        fn=update_image_display,
+        fn=load_image_from_selector,
         inputs=image_selector,
-        outputs=[input_image_display, clicked_x, clicked_y]
+        outputs=[input_image, image_state, prompt_box_state, corner_one_state, status_text]
     )
 
-    def store_click_coords(evt: gr.SelectData):
-        # Almacena las coordenadas del clic cuando el usuario hace clic en la imagen
-        return evt.index[1], evt.index[0]
-
-    input_image_display.select(
-        fn=store_click_coords,
-        inputs=None,
-        outputs=[clicked_x, clicked_y] # Gradio devuelve (y, x) para clics en imágenes
+    input_image.select(
+        fn=handle_image_click,
+        inputs=[corner_one_state],
+        outputs=[corner_one_state, prompt_box_state, status_text]
     )
-
-    def trigger_inference(image_idx, x, y):
-        # Esta función se llama cuando se pulsa el botón "Ejecutar Inferencia"
-        # y pasa los valores del estado a la función de inferencia.
-        return run_sam_inference(image_idx, x, y)
-
 
     run_button.click(
-        fn=trigger_inference,
-        inputs=[image_selector, clicked_x, clicked_y],
-        outputs=[output_original, output_ground_truth, output_predicted]
+        fn=run_inference,
+        inputs=[image_state, prompt_box_state],
+        outputs=[out_original, out_gt, out_pred, status_text]
     )
 
-    # Cargar la primera imagen al iniciar la demo
-    demo.load(
-        fn=lambda: update_image_display(0), # Carga la imagen 0 por defecto
-        inputs=None,
-        outputs=[input_image_display, clicked_x, clicked_y]
-    )
-
-
-demo.launch(share=True)
+demo.launch(debug=True)
